@@ -26,7 +26,7 @@ def capture_phishing_screenshots():
     for i, domain in enumerate(phishing_domains, 1):
         print(f"[{i}/{len(phishing_domains)}] {domain}")
         screenshot_path = f"evidences_temp/{domain}.png"
-        url = f"http://{domain}"  # You can switch to "https://" if needed
+        url = f"https://{domain}"  # You can switch to "https://" if needed
         
         try:
             with sync_playwright() as p:

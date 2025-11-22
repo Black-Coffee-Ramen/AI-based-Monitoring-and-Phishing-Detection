@@ -1,192 +1,168 @@
-import os
+# src/main_pipeline.py
+import pandas as pd
+import numpy as np
+import joblib
+from src.core.content_classifier import ContentClassifier
+from src.utils.html_fetcher import HTMLFetcher
+from src.features.lexical_features import extract_url_features
+from src.features.whois_features import extract_whois_features
 import logging
-from src.features.visual_similarity import validate_cse_phishing
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Complete CSE domain mappings for final reporting
-CSE_DOMAIN_MAPPINGS = {
-    "Airtel": "airtel.in",
-    "Bank_of_Baroda": "bankofbaroda.in", 
-    "RGCCI": "dc.crsorgi.gov.in",
-    "HDFC_Group": "hdfcbank.com",
-    "IRCTC": "irctc.co.in",
-    "Indian_Oil": "iocl.com",
-    "NIC": "nic.gov.in",
-    "PNB": "pnbindia.in",
-    "SBI": "onlinesbi.sbi",
-    "ICICI": "icicibank.com"  # ✅ Added as requested
-}
-
-def classify_lexical_only(domain):
-    """
-    Fallback classification using only lexical analysis
-    when visual evidence is unavailable
-    """
-    logger.info(f"🔤 Fallback to lexical analysis for {domain}")
+class EnhancedPhishingPipeline:
+    def __init__(self):
+        self.content_classifier = ContentClassifier()
+        self.html_fetcher = HTMLFetcher()
+        self.load_models()
     
-    # Your existing lexical analysis logic here
-    # This should return the same structure as classify_domain
+    def load_models(self):
+        """Load ML models"""
+        try:
+            self.lexical_model = joblib.load("models/lexical_model.pkl")
+            self.lexical_scaler = joblib.load("models/lexical_scaler.pkl")
+            self.lexical_selector = joblib.load("models/lexical_selector.pkl")
+            self.lexical_features = joblib.load("models/lexical_full_features.pkl")
+            self.models_loaded = True
+        except Exception as e:
+            logging.warning(f"Could not load ML models: {e}")
+            self.models_loaded = False
     
-    # Example simple lexical check
-    suspicious_keywords = ['login', 'secure', 'verify', 'account', 'banking', 'online']
-    domain_lower = domain.lower()
-    
-    keyword_matches = [kw for kw in suspicious_keywords if kw in domain_lower]
-    
-    if keyword_matches:
-        return {
-            "domain": domain,
-            "label": "Suspected",
-            "phishing_type": "Lexical Analysis",
-            "matched_cse": None,
-            "cse_domain": None,
-            "similarity_score": 0,
-            "hash_distance": None,
-            "confidence": "Low",
-            "detection_method": "lexical_fallback",
-            "matched_keywords": keyword_matches
-        }
-    else:
-        return {
-            "domain": domain,
-            "label": "Benign",  # Or whatever your baseline is
-            "phishing_type": None,
-            "matched_cse": None,
-            "cse_domain": None,
-            "similarity_score": 0,
-            "hash_distance": None,
-            "confidence": "Very Low",
-            "detection_method": "lexical_fallback",
-            "matched_keywords": []
-        }
-
-def classify_domain(domain, evidence_pdf_path, threshold=15):
-    """
-    Main classification function that uses visual similarity
-    to detect phishing domains mimicking CSE websites
-    """
-    logger.info(f"🔍 Analyzing {domain} for visual phishing...")
-    
-    # ✅ Check for failed evidence capture
-    if not os.path.exists(evidence_pdf_path) or "screenshot_failed" in evidence_pdf_path:
-        logger.warning(f"⚠️ Evidence missing/failed for {domain}, using lexical fallback")
-        return classify_lexical_only(domain)
-    
-    try:
-        # Use visual similarity detection
-        is_phishing, matched_cse, similarity_info = validate_cse_phishing(
-            domain=domain,
-            evidence_pdf_path=evidence_pdf_path,
-            threshold=threshold
+    def analyze_domain(self, domain, target_cse):
+        """Enhanced domain analysis with content classification"""
+        logging.info(f"🔍 Analyzing: {domain} -> {target_cse}")
+        
+        # 1. Get lexical features
+        lexical_features = self.get_lexical_features(domain)
+        
+        # 2. Get WHOIS features
+        whois_features = self.get_whois_features(domain)
+        
+        # 3. Get HTML content
+        html_content = self.html_fetcher.fetch_with_retry(domain)
+        
+        # 4. Content-based classification
+        content_classification = self.content_classifier.analyze_content(
+            html_content, domain, target_cse
         )
         
-        # Determine final label and details
-        if is_phishing:
-            label = "Phishing"
-            cse_domain = CSE_DOMAIN_MAPPINGS.get(matched_cse, "unknown-cse")
-            logger.info(f"🚨 PHISHING: {domain} visually mimics {matched_cse} ({cse_domain})")
+        # 5. Calculate lexical suspicion score
+        lexical_suspicion = self.calculate_lexical_suspicion(lexical_features, domain, target_cse)
+        
+        # 6. Final classification
+        final_label, confidence = self.final_classification(
+            content_classification, lexical_suspicion, whois_features, domain, target_cse
+        )
+        
+        return {
+            'domain': domain,
+            'target_cse': target_cse,
+            'final_label': final_label,
+            'confidence': confidence,
+            'content_classification': content_classification,
+            'lexical_suspicion': lexical_suspicion,
+            'domain_age': whois_features.get('domain_age_days', -1),
+            'html_content_length': len(html_content) if html_content else 0
+        }
+    
+    def get_lexical_features(self, domain):
+        """Extract lexical features"""
+        try:
+            df_temp = pd.DataFrame([{'domain': domain}])
+            features_df = extract_url_features(df_temp, domain_col='domain')
+            return features_df.iloc[0].to_dict() if len(features_df) > 0 else {}
+        except Exception as e:
+            logging.error(f"Error extracting lexical features for {domain}: {e}")
+            return {}
+    
+    def get_whois_features(self, domain):
+        """Extract WHOIS features"""
+        try:
+            df_temp = pd.DataFrame([{'domain': domain}])
+            features_df = extract_whois_features(df_temp, domain_col='domain')
+            return features_df.iloc[0].to_dict() if len(features_df) > 0 else {}
+        except Exception as e:
+            logging.error(f"Error extracting WHOIS features for {domain}: {e}")
+            return {}
+    
+    def calculate_lexical_suspicion(self, lexical_features, domain, target_cse):
+        """Calculate lexical suspicion score (0-1)"""
+        if not self.models_loaded:
+            # Fallback: simple rule-based scoring
+            return self.rule_based_suspicion(domain, target_cse)
+        
+        try:
+            # Prepare features for ML model
+            feature_vector = []
+            for feature_name in self.lexical_features:
+                feature_vector.append(lexical_features.get(feature_name, 0))
             
-            return {
-                "domain": domain,
-                "label": label,
-                "phishing_type": "Visual Mimicry",
-                "matched_cse": matched_cse,
-                "cse_domain": cse_domain,
-                "similarity_score": similarity_info.get('similarity', 0),
-                "hash_distance": similarity_info.get('distance', 0),
-                "confidence": "High",
-                "detection_method": "visual_similarity",
-                "evidence_path": evidence_pdf_path
-            }
+            feature_vector = np.array(feature_vector).reshape(1, -1)
+            
+            # Transform and predict
+            features_selected = self.lexical_selector.transform(feature_vector)
+            features_scaled = self.lexical_scaler.transform(features_selected)
+            probability = self.lexical_model.predict_proba(features_scaled)[0][1]
+            
+            return probability
+        except Exception as e:
+            logging.error(f"ML prediction failed for {domain}: {e}")
+            return self.rule_based_suspicion(domain, target_cse)
+    
+    def rule_based_suspicion(self, domain, target_cse):
+        """Rule-based fallback when ML models aren't available"""
+        domain_lower = domain.lower()
+        suspicion_score = 0
+        
+        # Typosquatting indicators
+        if self.is_typosquatting(domain, target_cse):
+            suspicion_score += 0.3
+        
+        # Suspicious TLDs
+        suspicious_tlds = ['.tk', '.ml', '.ga', '.cf', '.xyz', '.top', '.club']
+        if any(domain_lower.endswith(tld) for tld in suspicious_tlds):
+            suspicion_score += 0.2
+        
+        # Length-based suspicion
+        if len(domain) > 30:
+            suspicion_score += 0.1
+        
+        # Hyphen count
+        if domain.count('-') >= 2:
+            suspicion_score += 0.1
+        
+        return min(suspicion_score, 1.0)
+    
+    def is_typosquatting(self, domain, target_cse):
+        """Check for typosquatting patterns"""
+        domain_clean = domain.lower().replace('www.', '').replace('-', '')
+        
+        # Get CSE keywords
+        cse_keywords = self.content_classifier._get_brand_keywords(target_cse)
+        
+        for keyword in cse_keywords:
+            if keyword in domain_clean and len(keyword) > 2:
+                return True
+        return False
+    
+    def final_classification(self, content_class, lexical_suspicion, whois_features, domain, target_cse):
+        """Final classification logic"""
+        domain_age = whois_features.get('domain_age_days', 1000)
+        is_new_domain = domain_age < 30
+        
+        # DECISION MATRIX:
+        if content_class == "Phishing":
+            return "Phishing", max(lexical_suspicion, 0.8)
+        
+        elif content_class == "Legitimate Service":
+            return "Legitimate", 0.1  # Very low suspicion
+        
+        elif content_class == "Suspected":
+            # Suspected domains = lexical suspicion but no phishing content
+            if lexical_suspicion > 0.7 and is_new_domain:
+                return "Suspected", lexical_suspicion
+            elif lexical_suspicion > 0.8:
+                return "Suspected", lexical_suspicion
+            else:
+                return "Legitimate", 1 - lexical_suspicion
+        
         else:
-            label = "Suspected"
-            logger.info(f"⚠️ SUSPECTED: {domain} - No strong visual match found")
-            
-            return {
-                "domain": domain,
-                "label": label,
-                "phishing_type": "Generic Suspicious",
-                "matched_cse": None,
-                "cse_domain": None,
-                "similarity_score": similarity_info.get('similarity', 0) if similarity_info else 0,
-                "hash_distance": similarity_info.get('distance', 0) if similarity_info else None,
-                "confidence": "Medium",
-                "detection_method": "visual_similarity",
-                "evidence_path": evidence_pdf_path
-            }
-            
-    except Exception as e:
-        logger.error(f"❌ Visual analysis failed for {domain}: {e}")
-        # Fallback to lexical analysis
-        return classify_lexical_only(domain)
-
-def process_domains_batch(domain_list):
-    """Process multiple domains through the visual similarity pipeline"""
-    results = []
-    
-    for domain in domain_list:
-        # Assuming you have a function that captures PDF evidence
-        evidence_pdf_path = f"evidences_temp/{domain}.pdf"
-        
-        # Check if evidence capture failed (you might have a different indicator)
-        failed_evidence_path = f"evidences_temp/{domain}_screenshot_failed.pdf"
-        if os.path.exists(failed_evidence_path):
-            evidence_pdf_path = failed_evidence_path
-        
-        result = classify_domain(domain, evidence_pdf_path)
-        results.append(result)
-    
-    return results
-
-def print_detection_summary(results):
-    """Print a nice summary of detection results"""
-    phishing_count = sum(1 for r in results if r['label'] == 'Phishing')
-    suspected_count = sum(1 for r in results if r['label'] == 'Suspected')
-    benign_count = sum(1 for r in results if r['label'] == 'Benign')
-    
-    print("\n" + "="*50)
-    print("🎯 DETECTION SUMMARY")
-    print("="*50)
-    print(f"🔴 Phishing: {phishing_count}")
-    print(f"🟡 Suspected: {suspected_count}")
-    print(f"🟢 Benign: {benign_count}")
-    print(f"📊 Total: {len(results)}")
-    print("="*50)
-    
-    # Show phishing matches
-    phishing_domains = [r for r in results if r['label'] == 'Phishing']
-    if phishing_domains:
-        print("\n🚨 PHISHING DOMAINS DETECTED:")
-        for result in phishing_domains:
-            print(f"  • {result['domain']} → Mimics {result['matched_cse']} "
-                  f"({result['similarity_score']:.1f}% similar)")
-
-# Run the classification
-if __name__ == "__main__":
-    # Example domains to test
-    test_domains = [
-        "nichequalifyforcapital.com",
-        "sbi-secure-login.com", 
-        "hdfc-online-banking.com",
-        "icici-verification.com",  # Will use ICICI mapping
-        "failed-capture-domain.com"  # Will trigger lexical fallback
-    ]
-    
-    results = process_domains_batch(test_domains)
-    
-    # Print detailed results
-    for result in results:
-        print(f"\nDomain: {result['domain']}")
-        print(f"Label: {result['label']}")
-        print(f"Detection Method: {result['detection_method']}")
-        print(f"Confidence: {result['confidence']}")
-        if result['matched_cse']:
-            print(f"Mimics: {result['matched_cse']} ({result['cse_domain']})")
-            print(f"Similarity: {result['similarity_score']:.1f}%")
-        if result.get('matched_keywords'):
-            print(f"Keywords: {', '.join(result['matched_keywords'])}")
-    
-    # Print summary
-    print_detection_summary(results)
+            return "Legitimate", 0.2
